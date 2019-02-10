@@ -16,26 +16,20 @@
 """BERT sequence labeling
  runner."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import csv
-import os
-import logging
 import argparse
+import logging
+import os
 import random
-from tqdm import tqdm, trange
 
 import numpy as np
 import torch
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm, trange
 
-from pytorch_pretrained_bert.tokenization import BertTokenizer
 from pytorch_pretrained_bert.modeling import BertForTokenClassification
 from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
-from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
+from pytorch_pretrained_bert.tokenization import BertTokenizer
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
@@ -46,7 +40,7 @@ logger = logging.getLogger(__name__)
 class InputExample(object):
     """A single training/test example for simple token classification."""
 
-    def __init__(self, guid, text, labels=None):
+    def __init__(self, guid=None, text=None, labels=None, predicts=None):
         """Constructs a InputExample.
 
         Args:
@@ -59,6 +53,7 @@ class InputExample(object):
         self.guid = guid
         self.text = text
         self.labels = labels
+        self.predicts = predicts
 
 
 class InputFeatures(object):
@@ -73,16 +68,18 @@ class InputFeatures(object):
 
 class DataProcessor(object):
     """Base class for data converters for sequence classification data sets."""
-    def __init__(self):
+    def __init__(self, data_dir, do_lower_case):
         self.all_labels = []
+        self.data_dir = data_dir
+        self.do_lower_case = do_lower_case
 
-    def get_train_examples(self, data_dir):
+    def get_train_examples(self):
         """Gets a collection of `InputExample`s for the train set."""
-        return self._create_examples(os.path.join(data_dir, 'train.char.bmes'), 'train')
+        return self._create_examples(os.path.join(self.data_dir, 'train.char.bmes'), 'train')
 
-    def get_dev_examples(self, data_dir):
+    def get_dev_examples(self):
         """Gets a collection of `InputExample`s for the dev set."""
-        return self._create_examples(os.path.join(data_dir, 'dev.char.bmes'), 'dev')
+        return self._create_examples(os.path.join(self.data_dir, 'test.char.bmes'), 'dev')
 
     def _create_examples(self, file_name, set_type):
         """Creates examples for the training and dev sets."""
@@ -93,6 +90,8 @@ class DataProcessor(object):
             for (i, line) in enumerate(fi):
                 if line.strip():
                     token, label = line.strip().split()
+                    if self.do_lower_case:
+                        token = token.lower()
                     last_tokens.append(token)
                     last_labels.append(label)
                     if label not in self.all_labels:
@@ -112,6 +111,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         tokens = example.text[:(max_seq_length - 2)] if len(example.text) > max_seq_length - 2 else example.text
         labels = example.labels[:(max_seq_length - 2)] if len(example.labels) > max_seq_length - 2 else example.labels
         tokens = ["[CLS]"] + tokens + ["[SEP]"]
+        tokens = [t if t in tokenizer.vocab else "[UNK]" for t in tokens]
         labels = label_list[:1] + labels + label_list[:1]
 
         input_ids = tokenizer.convert_tokens_to_ids(tokens)
@@ -140,8 +140,158 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
     return features
 
 
+def get_ner_fmeasure(golden_lists, predict_lists, label_type="BMES"):
+    sent_num = len(golden_lists)
+    golden_full = []
+    predict_full = []
+    right_full = []
+    right_tag = 0
+    all_tag = 0
+    for idx in range(0, sent_num):
+        # word_list = sentence_lists[idx]
+        golden_list = golden_lists[idx]
+        predict_list = predict_lists[idx]
+        for idy in range(len(golden_list)):
+            if golden_list[idy] == predict_list[idy]:
+                right_tag += 1
+        all_tag += len(golden_list)
+        if label_type == "BMES":
+            gold_matrix = get_ner_BMES(golden_list)
+            pred_matrix = get_ner_BMES(predict_list)
+        else:
+            gold_matrix = get_ner_BIO(golden_list)
+            pred_matrix = get_ner_BIO(predict_list)
+        # logger.info "gold", gold_matrix
+        # logger.info "pred", pred_matrix
+        right_ner = list(set(gold_matrix).intersection(set(pred_matrix)))
+        golden_full += gold_matrix
+        predict_full += pred_matrix
+        right_full += right_ner
+    right_num = len(right_full)
+    golden_num = len(golden_full)
+    predict_num = len(predict_full)
+    if predict_num == 0:
+        precision = -1
+    else:
+        precision = (right_num + 0.0) / predict_num
+    if golden_num == 0:
+        recall = -1
+    else:
+        recall = (right_num + 0.0) / golden_num
+    if (precision == -1) or (recall == -1) or (precision + recall) <= 0.:
+        f_measure = -1
+    else:
+        f_measure = 2 * precision * recall / (precision + recall)
+    accuracy = (right_tag + 0.0) / all_tag
+    # logger.info "Accuracy: ", right_tag,"/",all_tag,"=",accuracy
+    logger.info(F"gold_num = {golden_num} pred_num = {predict_num} right_num = {right_num}")
+    return accuracy, precision, recall, f_measure
+
+
+def get_ner_BMES(label_list):
+    # list_len = len(word_list)
+    # assert(list_len == len(label_list)), "word list size unmatch with label list"
+    list_len = len(label_list)
+    begin_label = 'B-'
+    end_label = 'E-'
+    single_label = 'S-'
+    whole_tag = ''
+    index_tag = ''
+    tag_list = []
+    stand_matrix = []
+    for i in range(0, list_len):
+        # wordlabel = word_list[i]
+        current_label = label_list[i].upper()
+        if begin_label in current_label:
+            if index_tag != '':
+                tag_list.append(whole_tag + ',' + str(i - 1))
+            whole_tag = current_label.replace(begin_label, "", 1) + '[' + str(i)
+            index_tag = current_label.replace(begin_label, "", 1)
+
+        elif single_label in current_label:
+            if index_tag != '':
+                tag_list.append(whole_tag + ',' + str(i - 1))
+            whole_tag = current_label.replace(single_label, "", 1) + '[' + str(i)
+            tag_list.append(whole_tag)
+            whole_tag = ""
+            index_tag = ""
+        elif end_label in current_label:
+            if index_tag != '':
+                tag_list.append(whole_tag + ',' + str(i))
+            whole_tag = ''
+            index_tag = ''
+        else:
+            continue
+    if (whole_tag != '') & (index_tag != ''):
+        tag_list.append(whole_tag)
+    tag_list_len = len(tag_list)
+
+    for i in range(0, tag_list_len):
+        if len(tag_list[i]) > 0:
+            tag_list[i] = tag_list[i] + ']'
+            insert_list = reverse_style(tag_list[i])
+            stand_matrix.append(insert_list)
+    # logger.info stand_matrix
+    return stand_matrix
+
+
+def get_ner_BIO(label_list):
+    # list_len = len(word_list)
+    # assert(list_len == len(label_list)), "word list size unmatch with label list"
+    list_len = len(label_list)
+    begin_label = 'B-'
+    inside_label = 'I-'
+    whole_tag = ''
+    index_tag = ''
+    tag_list = []
+    stand_matrix = []
+    for i in range(0, list_len):
+        # wordlabel = word_list[i]
+        current_label = label_list[i].upper()
+        if begin_label in current_label:
+            if index_tag == '':
+                whole_tag = current_label.replace(begin_label, "", 1) + '[' + str(i)
+                index_tag = current_label.replace(begin_label, "", 1)
+            else:
+                tag_list.append(whole_tag + ',' + str(i - 1))
+                whole_tag = current_label.replace(begin_label, "", 1) + '[' + str(i)
+                index_tag = current_label.replace(begin_label, "", 1)
+
+        elif inside_label in current_label:
+            if current_label.replace(inside_label, "", 1) == index_tag:
+                whole_tag = whole_tag
+            else:
+                if (whole_tag != '') & (index_tag != ''):
+                    tag_list.append(whole_tag + ',' + str(i - 1))
+                whole_tag = ''
+                index_tag = ''
+        else:
+            if (whole_tag != '') & (index_tag != ''):
+                tag_list.append(whole_tag + ',' + str(i - 1))
+            whole_tag = ''
+            index_tag = ''
+
+    if (whole_tag != '') & (index_tag != ''):
+        tag_list.append(whole_tag)
+    tag_list_len = len(tag_list)
+
+    for i in range(0, tag_list_len):
+        if len(tag_list[i]) > 0:
+            tag_list[i] = tag_list[i] + ']'
+            insert_list = reverse_style(tag_list[i])
+            stand_matrix.append(insert_list)
+    return stand_matrix
+
+
+def reverse_style(input_string):
+    target_position = input_string.index('[')
+    input_len = len(input_string)
+    output_string = input_string[target_position:input_len] + input_string[0:target_position]
+    return output_string
+
+
 def accuracy(out, labels):
-    outputs = np.argmax(out, axis=1)
+    outputs = np.argmax(out, axis=-1)
     return np.sum(outputs == labels)
 
 
@@ -199,12 +349,10 @@ def main():
     if not args.do_train and not args.do_eval:
         raise ValueError("At least one of `do_train` or `do_eval` must be True.")
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, args.task_name), exist_ok=True)
 
-    task_name = args.task_name.lower()
-
-    processor = DataProcessor()
-    train_examples = processor.get_train_examples(args.data_dir)
+    processor = DataProcessor(os.path.join(args.data_dir, args.task_name), do_lower_case=args.do_lower_case)
+    train_examples = processor.get_train_examples()
     label_list = processor.all_labels
     num_labels = len(label_list)
 
@@ -306,7 +454,7 @@ def main():
 
     # Save a trained model
     model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
-    output_model_file = os.path.join(args.output_dir, "pytorch_model.bin")
+    output_model_file = os.path.join(args.output_dir, args.task_name, "pytorch_model.bin")
     if args.do_train:
         torch.save(model_to_save.state_dict(), output_model_file)
 
@@ -317,7 +465,7 @@ def main():
         model = BertForTokenClassification.from_pretrained(args.bert_model, state_dict=model_state_dict, num_labels=num_labels)
         model.to(device)
 
-        eval_examples = processor.get_dev_examples(args.data_dir)
+        eval_examples = processor.get_dev_examples()
         eval_features = convert_examples_to_features(eval_examples, label_list, args.max_seq_length, tokenizer)
         logger.info("***** Running evaluation *****")
         logger.info("  Num examples = %d", len(eval_examples))
@@ -332,6 +480,7 @@ def main():
         eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
         model.eval()
+        all_examples = []
         eval_loss, eval_accuracy = 0, 0
         nb_eval_steps, nb_eval_examples = 0, 0
 
@@ -345,32 +494,49 @@ def main():
                 tmp_eval_loss = model(input_ids, segment_ids, input_mask, label_ids)
                 logits = model(input_ids, segment_ids, input_mask)
 
-            logits = logits.detach().cpu().numpy()
-            label_ids = label_ids.cpu().numpy()
-            tmp_eval_accuracy = accuracy(logits, label_ids)
-
+            examples = get_output_file(logits, input_ids, input_mask, label_ids, tokenizer.ids_to_tokens, processor.all_labels)
+            all_examples.extend(examples)
             eval_loss += tmp_eval_loss.mean().item()
-            eval_accuracy += tmp_eval_accuracy
 
             nb_eval_examples += input_ids.size(0)
             nb_eval_steps += 1
 
         eval_loss = eval_loss / nb_eval_steps
-        eval_accuracy = eval_accuracy / nb_eval_examples
-        loss = tr_loss / nb_tr_steps if args.do_train else None
+        acc, p, r, f1 = get_ner_fmeasure([e.labels for e in all_examples], [e.predicts for e in all_examples])
+
         result = {'eval_loss': eval_loss,
-                  'eval_accuracy': eval_accuracy,
-                  'global_step': global_step,
-                  'loss': loss}
+                  'eval_accuracy': acc,
+                  'precision': p,
+                  'recall': r,
+                  'f_meature': f1,
+                  }
 
         logger.info("***** Eval results *****")
         for key in sorted(result.keys()):
             logger.info("  %s = %s", key, str(result[key]))
 
-        output_eval_file = os.path.join(args.output_dir, "eval_results.txt")
+        output_eval_file = os.path.join(args.output_dir, args.task_name, "eval_results.txt")
         with open(output_eval_file, "w") as writer:
-            for key in sorted(result.keys()):
-                writer.write("%s = %s\n" % (key, str(result[key])))
+            for example in all_examples:
+                for token, label, pred in zip(example.text, example.labels, example.predicts):
+                    writer.write(F"{token} {label} {pred}\n")
+                writer.write('\n')
+
+
+def get_output_file(logits, input_ids, input_mask, label_ids, token_vocab, label_vocab):
+    logits = logits.detach().cpu().numpy()
+    predicts = np.argmax(logits, axis=-1)
+    input_ids = input_ids.cpu().numpy()
+    input_mask = input_mask.cpu().numpy()
+    label_ids = label_ids.cpu().numpy()
+    examples = []
+    for sent_num in range(len(logits)):
+        sentence_length = np.sum(input_mask[sent_num])
+        input_tokens = [token_vocab[token] for token in input_ids[sent_num]][1: sentence_length - 1]
+        labels = [label_vocab[token] for token in label_ids[sent_num]][1: sentence_length - 1]
+        predictions = [label_vocab[token] for token in predicts[sent_num]][1: sentence_length - 1]
+        examples.append(InputExample(text=input_tokens, labels=labels, predicts=predictions))
+    return examples
 
 
 if __name__ == "__main__":
